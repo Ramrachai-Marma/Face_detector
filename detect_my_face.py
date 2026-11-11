@@ -4,53 +4,58 @@ Simple face detection: First detect all faces, then identify which one is you
 """
 
 import os
-import cv2
 from rich import print
+
+import cv2
 
 from advanced.detector import HaarFaceDetector
 from advanced.recognizer import LBPHRecognizer
 from advanced.utils import ensure_dir, save_image
 from advanced.dataset import enroll_images, load_dataset
+from advanced.identity import find_label_id
+from advanced.config import DATA_DIR, MODELS_DIR, OUTPUTS_DIR, PROJECT_DIR
+
+DEFAULT_PERSON = "myself"
 
 
-def _ensure_trained(person_name: str = "mark") -> bool:
+def _ensure_trained(person_name: str = DEFAULT_PERSON) -> bool:
     """
-    Ensure a trained model exists. If missing, enroll from a single image
-    like data/people/mark.jpg and train the recognizer.
+    Ensure a trained model exists, training it from the enrolled dataset if needed.
     """
     try:
         recognizer = LBPHRecognizer()
-        # If a model exists, ensure it includes the requested person; otherwise retrain
-        if os.path.exists(os.path.join(os.getcwd(), "models", "lbph.yml")):
-            try:
-                labels = recognizer.load()
-                have = {v.lower().strip() for v in labels.values()}
-                if person_name.lower().strip() in have:
-                    return True
-                # Otherwise fall through to retrain with current dataset
-            except Exception:
-                pass
+        # Preserve an existing model when it does not contain the requested identity.
+        if os.path.exists(os.path.join(MODELS_DIR, "lbph.yml")):
+            labels = recognizer.load()
+            have = {name.lower().strip() for name in labels.values()}
+            if person_name.lower().strip() in have:
+                return True
+            available = ", ".join(sorted(labels.values())) or "<none>"
+            print(
+                f"[red]Model does not contain '{person_name}'. "
+                f"Available labels: {available}. The existing model was not changed.[/red]"
+            )
+            return False
 
-        data_root = os.path.join(os.getcwd(), "data", "people")
-        # Look inside data/people and also project root for a single training image
+        data_root = DATA_DIR
+        # Check the data directory and project root for a single source image.
         candidates = [
             os.path.join(data_root, f"{person_name}.jpg"),
             os.path.join(data_root, f"{person_name}.jpeg"),
             os.path.join(data_root, f"{person_name}.png"),
-            os.path.join(os.getcwd(), f"{person_name}.jpg"),
-            os.path.join(os.getcwd(), f"{person_name}.jpeg"),
-            os.path.join(os.getcwd(), f"{person_name}.png"),
-            os.path.join(os.getcwd(), "Mark.jpeg"),
-            os.path.join(os.getcwd(), "Mark.jpg"),
-            os.path.join(os.getcwd(), "Mark.png"),
+            os.path.join(PROJECT_DIR, f"{person_name}.jpg"),
+            os.path.join(PROJECT_DIR, f"{person_name}.jpeg"),
+            os.path.join(PROJECT_DIR, f"{person_name}.png"),
+            os.path.join(PROJECT_DIR, "Mark.jpeg"),
+            os.path.join(PROJECT_DIR, "Mark.jpg"),
+            os.path.join(PROJECT_DIR, "Mark.png"),
         ]
         single_image = next((p for p in candidates if os.path.isfile(p)), None)
         if single_image is not None:
             saved = enroll_images(person_name, [single_image])
-            # Fallback: if no face detected during enrollment, save a resized full image
+            # Retain a resized fallback image when enrollment detects no face.
             if not saved:
                 try:
-                    import cv2
                     img = cv2.imread(single_image)
                     if img is not None:
                         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -58,11 +63,11 @@ def _ensure_trained(person_name: str = "mark") -> bool:
                         out_dir = os.path.join(data_root, person_name)
                         os.makedirs(out_dir, exist_ok=True)
                         out_path = os.path.join(out_dir, f"{person_name}_0000.jpg")
-                        cv2.imwrite(out_path, resized)
-                except Exception:
-                    pass
+                        save_image(out_path, resized)
+                except Exception as e:
+                    raise OSError(f"Could not create fallback training image: {e}") from e
 
-        # Simple augmentation when there are too few samples (mirror/brightness/blur)
+        # Augment small enrollment sets with mirrored, brightness-adjusted, and blurred samples.
         try:
             person_dir = os.path.join(data_root, person_name)
             existing = []
@@ -72,7 +77,6 @@ def _ensure_trained(person_name: str = "mark") -> bool:
                         if f.lower().endswith((".jpg", ".jpeg", ".png")):
                             existing.append(os.path.join(root, f))
             if len(existing) <= 2 and existing:
-                import cv2
                 base = cv2.imread(existing[0], cv2.IMREAD_GRAYSCALE)
                 if base is not None:
                     variants = []
@@ -85,13 +89,21 @@ def _ensure_trained(person_name: str = "mark") -> bool:
                     os.makedirs(person_dir, exist_ok=True)
                     for idx, v in enumerate(variants):
                         out_path = os.path.join(person_dir, f"{person_name}_aug_{idx:02d}.jpg")
-                        cv2.imwrite(out_path, v)
-        except Exception:
-            pass
+                        save_image(out_path, v)
+        except Exception as e:
+            raise OSError(f"Could not create augmented training image: {e}") from e
 
         features, targets, labels = load_dataset()
         if not features:
             print("[red]No training data found in 'data/people'. Add images and retry.[/red]")
+            return False
+        available = {name.lower().strip() for name in labels.values()}
+        if person_name.lower().strip() not in available:
+            names = ", ".join(sorted(labels.values())) or "<none>"
+            print(
+                f"[red]No training examples found for '{person_name}'. "
+                f"Available labels: {names}. No model was saved.[/red]"
+            )
             return False
         recognizer.train(features, targets, labels)
         print("[green]Model trained and saved.[/green]\n")
@@ -101,38 +113,28 @@ def _ensure_trained(person_name: str = "mark") -> bool:
         return False
 
 
-def detect_my_face(image_path: str, person_name: str = "mark"):
+def detect_my_face(image_path: str, person_name: str = DEFAULT_PERSON):
     """
     Detect all faces first, then identify which one is you
     """
     try:
-        # Load the trained model (train if missing)
-        if not os.path.exists("models/lbph.yml"):
+        # Load the existing model, training from enrolled data when necessary.
+        if not os.path.exists(os.path.join(MODELS_DIR, "lbph.yml")):
             if not _ensure_trained(person_name):
                 return False
         recognizer = LBPHRecognizer()
         labels = recognizer.load()
         
-        # Find your label ID
-        your_label_id = None
-        target = person_name.lower().strip()
-        for label_id, name in labels.items():
-            if name.lower().strip() == target:
-                your_label_id = int(label_id)
-                break
-        
+        your_label_id = find_label_id(labels, person_name)
         if your_label_id is None:
             available = ", ".join(sorted(labels.values())) or "<none>"
-            # Backward-compat: if only one label exists, assume it's the target
-            if len(labels) == 1:
-                only_id = int(next(iter(labels.keys())))
-                print(f"[yellow]Label '{person_name}' not found. Using the only available label: '{labels[str(only_id)]}'.[/yellow]")
-                your_label_id = only_id
-            else:
-                print(f"[red]Error: Could not find '{person_name}' in the trained model. Available: {available}[/red]")
-                return False
+            print(
+                f"[red]Error: Could not find '{person_name}' in the trained model. "
+                f"Available: {available}[/red]"
+            )
+            return False
         
-        # Load image
+        # Load the source image.
         img = cv2.imread(image_path)
         if img is None:
             print(f"[red]Error: Could not load image '{image_path}'[/red]")
@@ -140,7 +142,7 @@ def detect_my_face(image_path: str, person_name: str = "mark"):
         
         print(f"Processing: {os.path.basename(image_path)}")
         
-        # Step 1: Detect ALL faces
+        # Detect faces before evaluating identity matches.
         detector = HaarFaceDetector()
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         try:
@@ -154,10 +156,9 @@ def detect_my_face(image_path: str, person_name: str = "mark"):
             minNeighbors=3,
             minSize=(24, 24)
         )
-        # Second pass: if no faces, upscale and try slightly different params
+        # Retry detection on an enlarged image when the initial pass finds no faces.
         if len(faces) == 0:
             try:
-                import numpy as np
                 up = cv2.resize(gray, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_LINEAR)
                 faces_up = detector.cascade.detectMultiScale(
                     up,
@@ -166,7 +167,7 @@ def detect_my_face(image_path: str, person_name: str = "mark"):
                     minSize=(20, 20)
                 )
                 if len(faces_up) > 0:
-                    # Map back to original scale
+                    # Convert the enlarged-image coordinates to the source-image scale.
                     mapped = []
                     for (x, y, w, h) in faces_up:
                         mapped.append((int(x/1.5), int(y/1.5), int(w/1.5), int(h/1.5)))
@@ -180,13 +181,12 @@ def detect_my_face(image_path: str, person_name: str = "mark"):
             print("[yellow]No faces detected![/yellow]")
             return False
         
-        # Step 2: Check each face to see if it's you
+        # Compare each detected face with the requested identity.
         output_img = img.copy()
         my_face_found = False
         THRESHOLD = 135.0
         best_conf = float('inf')
         best_box = None
-        candidate_confs = []
         
         def crop_and_score(x, y, w, h):
             """Try multiple slight variations of the crop and return best (min) confidence."""
@@ -223,39 +223,27 @@ def detect_my_face(image_path: str, person_name: str = "mark"):
             return local_best, local_box
 
         for i, (x, y, w, h) in enumerate(faces):
-            # Extract face region
+            # Score the face region using several crop variations.
             confidence, tuned_box = crop_and_score(x, y, w, h)
             label_id = your_label_id if confidence != float('inf') else -1
             
             print(f"  Face {i+1}: label_id={label_id}, confidence={confidence:.1f}")
             
-            # Track the single best match to 'myself' only
+            # Keep the lowest-distance match for the requested identity.
             if label_id == your_label_id:
-                candidate_confs.append(confidence)
                 if confidence < best_conf:
                     best_conf = confidence
                     best_box = tuned_box
         
-        # Draw only the best matching face (if confident enough)
-        dyn_ok = False
-        if candidate_confs:
-            s = sorted(candidate_confs)
-            if len(s) % 2 == 1:
-                median_conf = s[len(s)//2]
-            else:
-                median_conf = (s[len(s)//2 - 1] + s[len(s)//2]) / 2.0
-            # Accept if clearly better than peers by margin
-            if best_conf <= (median_conf - 15.0):
-                dyn_ok = True
-        if best_box is not None and (best_conf <= THRESHOLD or dyn_ok):
+        if best_box is not None and best_conf <= THRESHOLD:
             x, y, w, h = best_box
             cv2.rectangle(output_img, (x, y), (x + w, y + h), (0, 255, 0), 3)
             cv2.putText(output_img, f"ME ({best_conf:.1f})", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             my_face_found = True
         # Save result
-        ensure_dir("outputs")
+        ensure_dir(OUTPUTS_DIR)
         base_name = os.path.splitext(os.path.basename(image_path))[0]
-        output_path = f"outputs/{base_name}_my_face.jpg"
+        output_path = os.path.join(OUTPUTS_DIR, f"{base_name}_my_face.jpg")
         save_image(output_path, output_img)
         
         print(f"\n[green]Result saved: {output_path}[/green]")
@@ -275,17 +263,19 @@ def main():
     print("[bold blue]Detect My Face - Simple Approach[/bold blue]")
     print("This script detects all faces first, then identifies which one is you.\n")
     
-    # Ensure model exists or try to train from data/people/mark.jpg
-    if not _ensure_trained("mark"):
+    # Ensure the model exists or train it from the local enrollment dataset.
+    if not _ensure_trained(DEFAULT_PERSON):
         return
     
-    # Process the provided group photos
-    group_files = ["Mark group.jpg", "Mark group1.jpg"]
+    # Process the configured group photographs.
+    group_files = [
+        os.path.join(PROJECT_DIR, "Mark group.jpg"),
+        os.path.join(PROJECT_DIR, "Mark group1.jpg"),
+    ]
     total_found = 0
 
     for name in group_files:
-        candidates = [name, f"{name}.jpg", f"{name}.JPG", f"{name}.png", f"{name}.PNG"]
-        group_file = next((c for c in candidates if os.path.exists(c)), None)
+        group_file = name if os.path.exists(name) else None
         if group_file is None:
             print(f"⚠ {name} not found, skipping...")
             continue
@@ -293,13 +283,12 @@ def main():
         print(f"\n[yellow]Processing {group_file}...[/yellow]")
         print("-" * 50)
         
-        if detect_my_face(group_file, person_name="mark"):
+        if detect_my_face(group_file, person_name=DEFAULT_PERSON):
             total_found += 1
     
     print(f"\n[bold]Summary: Found your face in {total_found} out of {len(group_files)} images[/bold]")
-    print("Check the 'outputs/' folder for results with your face highlighted in GREEN!")
+    print(f"Check '{OUTPUTS_DIR}' for results with your face highlighted in GREEN!")
 
 
 if __name__ == "__main__":
     main()
-
